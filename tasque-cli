@@ -1,0 +1,382 @@
+#!/usr/bin/env python
+"""tasque-cli - a command line interface Tasque, a "Useful Task List"
+
+Copyright (c) 2011, David Newgas <david@newgas.net>
+
+c   View list of categories
+d   Mark selected task as done
+j   Move down
+k   Move up
+n   New task
+q   Quit
+r   Refresh view
+v   Toggle visibility of completed/deleted tasks
+w   Set date when task is due
+x   Delete selected task
+.   Mark selected task as low priority
+;   Mark selected task as medium priority
+!   Mark selected task as high priority
+?   Show this help text.
+"""
+
+import curses, curses.wrapper, sys, time, dbus, datetime
+
+class state:
+    """An enum of the states tasks can be in.
+
+    Also has describtive and emoticon representations."""
+    active=0
+    inactive=1
+    completed=2
+    deleted=3
+    text=['Active','Inactive','Completed','Deleted']
+    icon = ['( )','(.)','(v)','(x)']
+
+class priority:
+    none=0
+    low = 1
+    medium = 2
+    high = 3
+    text= ['None','Low','Medium','High']
+    icon = [' ','.',';','!']
+
+class Task:
+    tid = 0
+    name = ''
+    category = ''
+    priority = priority.none
+    state = state.active
+    duedate = datetime.datetime.max
+    duedatetext = ''
+    def __init__(self, tid):
+        self.tid=tid
+
+    def __init__(self, tid, tasque):
+        self.tid=tid
+        self.fetch(tasque)
+
+    def fetch(self,tasque):
+            self.name = tasque.GetNameForTaskById(self.tid)
+            self.category = tasque.GetCategoryForTaskById(self.tid)
+            self.state = tasque.GetStateForTaskById(self.tid)
+            timestamp = tasque.GetDueDateForTaskById(self.tid)
+            if timestamp == 0:
+                self.duedate = datetime.datetime.max
+                self.duedatetext=''
+            else:
+                self.duedate = datetime.datetime.fromtimestamp(timestamp)
+                self.duedatetext = self.duedate.strftime("%d/%m")
+            self.priority = tasque.GetPriorityForTaskById(self.tid)
+  
+class Tasks(list):
+    """A local list of tasks from a tasque session.
+
+    Access is as an array, with each element being a tuple of
+    (task id, name, category, state)
+
+    Constructor takes one variable, a dbus proxy for org.gnome.Tasque.RemoteControl
+
+    Method update() refreshes the data over dbus.
+    """
+    
+    def __init__(self,tasque):
+        self.tasque = tasque
+        self.update()
+        
+    def update(self):
+        """Update the list from the remote tasque session."""
+        task_ids = self.tasque.GetTaskIds()
+        del self[:]
+        for tid in task_ids:
+            task = Task(tid,self.tasque)
+            self.append(task)
+        self.sort(key=lambda task: task.duedate)
+
+def retrieve_categories(tasque):
+    """Fetch a list of defined categories.
+
+    Only argument is a dbus proxy for org.gnome.Tasque,RemoteControl.
+
+    Returns an dbus.Array of dbus.String."""
+    return tasque.GetCategoryNames()
+
+def draw_menu(maxy,maxx,string="q:Quit  r:Refresh  n:New  d:Done  v:Visibility  c:Categories ?:Help"):
+    """Draw a bar across the top of the screen.
+
+    Arguments:
+    maxy - height of screen.
+    maxx - width of screen.
+    string - text of menu. Defaults to main menu."""
+    menu = curses.newwin(1,maxx,0,0)
+    menu.bkgd(" ", curses.A_STANDOUT)
+    menu.addstr(0,0,string)
+    menu.refresh()
+
+def draw_cmdwin(maxy,maxx):
+    """Draw a bar across the bottom of the screen.
+
+    Arguments:
+    maxy - height of screen.
+    maxx - width of screen."""
+    win = curses.newwin(1,maxx,maxy-1,0)
+    win.addstr("# ")
+    win.refresh()
+    return win
+
+class TaskView:
+    """A curses based view of a Tasks object.
+
+    Constructor arguments:
+    stdscr - the curses screen to draw on.
+    Tasks - the Tasks object to represent.
+
+    Methods:
+    update - redraw the view.
+    getch - get a user inputted character.
+    scrollup - move the selection up.
+    scrolldown - move the selection down.
+    handleresize - react to a screen resize.
+    toggleshowcomplete - toggle visibility of complete icons.
+
+    Variables:
+    selectedpos - the currently highlighted index into the Tasks object.
+    """
+    scrollpos = 0
+    selectedpos = 1
+    showcomplete=False
+    def __init__ (self,stdscr,tasks):
+        self.stdscr = stdscr
+        self.tasks=tasks
+        self.curlen = len(self.tasks)
+        (self.maxy,self.maxx) = self.stdscr.getmaxyx()
+        self.displayarea = curses.newpad(self.curlen,self.maxx)
+        self.displayarea.keypad(1);
+        self.selectedpos = self.prevpos()
+        self.update()
+
+    def update(self):
+        """Redraw the task list with latest data."""
+        self.displayarea.clear()
+        if len(self.tasks) > self.curlen:       
+            self.displayarea = curses.newpad(len(self.tasks),self.maxx)
+            self.displayarea.keypad(1);     
+        self.curlen=len(self.tasks)
+        adjustedi = 0
+        scrolloffset = 0
+        group = 0 # 0 = none, 1=Overdue, 2=Today, 3=Next Week,4=Future
+        for i in range(self.curlen):
+            if self.showcomplete == False and self.tasks[i].state!=state.active:
+                if self.scrollpos > i:
+                    scrolloffset +=1
+                continue
+            if i == self.selectedpos:
+		    self.displayarea.addstr(adjustedi,0,
+                                            "{state: <3}{priority: <1}{name:<56}{date: <5} {cat: <13}"
+                                            .format(
+                                                name=self.tasks[i].name,
+                                                cat=self.tasks[i].category,
+                                                state=state.icon[self.tasks[i].state],
+                                                priority=priority.icon[self.tasks[i].priority],
+                                                date=self.tasks[i].duedatetext),
+                                            curses.A_STANDOUT)
+            else:
+		    self.displayarea.addstr(adjustedi,0,
+                                            "{state: <3}{priority: <1}{name:<56}{date: <5} {cat: <13}"
+                                            .format(
+                                                name=self.tasks[i].name,
+                                                cat=self.tasks[i].category,
+                                                state=state.icon[self.tasks[i].state],
+                                                priority=priority.icon[self.tasks[i].priority],
+                                                date=self.tasks[i].duedatetext))
+            adjustedi += 1
+        self.displayarea.refresh(self.scrollpos-scrolloffset,0,1,0,self.maxy-2,self.maxx)
+
+    def getch(self):
+        """Get a character from the user."""
+        return self.displayarea.getch()
+
+    # These two functions look insane, but it makes sense. if we are already
+    # at one end of the list, we do nothing.  If we are in show complete mode
+    # we just move along one in the appropriate direction.
+    # The complex bit is if we are hiding completed tasks - we keep going in the
+    # desired direction, until we find a incomplete task. If there isn't one,
+    # we change direction, as we are already at one end and just want to find
+    # the item closest to that edge. If we still don't find one, there are no
+    # incomplete tasks, so return 0.
+    def prevpos(self):
+        prev = self.selectedpos
+        if prev > 0:
+            prev -= 1
+            if self.showcomplete == False:
+                while self.tasks[prev].state!=state.active:
+                    prev -= 1
+                    if prev < 0:
+                        prev = 0
+                        while self.tasks[prev].state!=state.active:
+                            prev +=1
+                            if prev >= self.curlen:
+                                prev=0
+                                break
+                        break
+        return prev
+
+    def nextpos(self):
+        nxt = self.selectedpos
+        if nxt < self.curlen-1:
+            nxt += 1
+            if self.showcomplete == False:
+                while self.tasks[nxt].state!=state.active:
+                    nxt += 1
+                    if nxt >= self.curlen:
+                        nxt = self.curlen-1
+                        while self.tasks[nxt].state!=state.active:
+                            nxt -= 1
+                            if nxt <= 0:
+                                nxt = 0
+                                break
+                        break
+        return nxt
+
+    def scrollup(self):
+        prev = self.prevpos()
+        if prev != self.selectedpos:
+            self.selectedpos = prev
+            if self.selectedpos < self.scrollpos:
+                self.scrollpos = self.selectedpos
+            self.update()
+
+    def scrolldown(self):
+        nxt = self.nextpos()
+        if nxt != self.selectedpos:
+            self.selectedpos = nxt
+            if self.selectedpos - self.scrollpos > self.maxy -3:
+                self.scrollpos = self.selectedpos - self.maxy + 2
+            self.update()
+
+    def handleresize(self):        
+        (self.maxy,self.maxx) = self.stdscr.getmaxyx()
+        if self.scrollpos > self.curlen - self.maxy + 2:
+            self.scrollpos = self.curlen - self.maxy + 2
+        if self.scrollpos < 0:
+            self.scrollpos = 0
+        if self.selectedpos > self.scrollpos +self.maxy - 3:
+            self.selectedpos = self.scrollpos+self.maxy -3
+        self.update()
+
+    def toggleshowcomplete(self):
+        """Toggle visibility of complete icons."""
+        self.showcomplete = not self.showcomplete
+        if self.tasks[self.selectedpos].state==state.completed:
+            self.selectedpos = self.nextpos()
+        self.update()
+             
+
+def main(stdscr):
+    tasque = dbus.Interface(dbus.SessionBus().get_object('org.gnome.Tasque','/org/gnome/Tasque/RemoteControl'),'org.gnome.Tasque.RemoteControl')
+    tasks = Tasks(tasque)
+    categories = retrieve_categories(tasque)
+
+    (maxy,maxx) = stdscr.getmaxyx()
+    curses.curs_set(0)
+    draw_menu(maxy,maxx)
+    cmdwin = draw_cmdwin(maxy,maxx)
+    taskview = TaskView(stdscr,tasks)
+
+    while True:
+        c=taskview.getch()
+        if c==ord('c'):
+            catwin = curses.newwin(maxy-2,maxx,1,0)
+            cats = retrieve_categories(tasque)
+            for i in range(len(cats)):
+                catwin.addstr(i,0,cats[i])
+            draw_menu(maxy,maxx,"Press any key to continue")
+            catwin.refresh()
+            catwin.getch()
+            catwin.clear()
+            catwin.refresh()
+            draw_menu(maxy,maxx)
+            taskview.update()
+        elif c==ord('d'):
+            tasque.MarkTaskAsCompleteById(tasks[taskview.selectedpos].tid)
+            tasks.update()
+            taskview.update()
+        elif c==curses.KEY_DOWN or c==ord('j'):
+            taskview.scrolldown()
+        elif c==curses.KEY_UP or c==ord('k'):
+            taskview.scrollup();
+        elif c==ord('n'):
+            draw_menu(maxy,maxx,"Type your task (including time)")
+            curses.echo()
+            taskname = cmdwin.getstr(0,3)
+            curses.noecho()
+            cmdwin = draw_cmdwin(maxy,maxx)
+            if taskname != '':
+                draw_menu(maxy,maxx,"Type your Category (blank for Inbox)")
+                curses.echo()
+                category = cmdwin.getstr(0,3)
+                curses.noecho()
+                cmdwin = draw_cmdwin(maxy,maxx)
+                if category == '':
+                    category = 'Inbox'
+                tasque.CreateTask(category,taskname,False,True)
+                tasks.update()
+            draw_menu(maxy,maxx)
+            taskview.update()
+        elif c==ord('q'):
+            break
+        elif c==ord('r'):
+            tasks.update()
+            taskview.update()
+        elif c==ord('v'):
+            taskview.toggleshowcomplete()
+        elif c==ord('w'):
+            draw_menu(maxy,maxx,"Type due date in DD/MM/YYYY Format, or blank for no date")
+            curses.echo()
+            date = cmdwin.getstr(0,3)
+            curses.noecho()
+            if date == '':
+                date = 0
+            else:
+                date=int(time.mktime(time.strptime(date,"%d/%m/%Y")))
+            tasque.SetDueDateForTaskById(tasks[taskview.selectedpos].tid,date)
+            draw_menu(maxy,maxx)
+        elif c==ord('x'):
+            tasque.DeleteTaskById(tasks[taskview.selectedpos].tid)
+            tasks.update()
+            taskview.update()
+        elif c==ord('!'):
+            tasque.SetPriorityForTaskById(tasks[taskview.selectedpos].tid,
+                                          priority.high)
+            tasks.update()
+            taskview.update()
+        elif c==ord(';'):
+            tasque.SetPriorityForTaskById(tasks[taskview.selectedpos].tid,
+                                          priority.medium)
+            tasks.update()
+            taskview.update()
+        elif c==ord('.'):
+            tasque.SetPriorityForTaskById(tasks[taskview.selectedpos].tid,
+                                          priority.low)
+            tasks.update()
+            taskview.update()
+        elif c==ord('?'):
+            helpwin = curses.newwin(maxy-2,maxx,1,0)
+            helpwin.addstr(0,0,__doc__)
+            draw_menu(maxy,maxx,"Press any key to continue")
+            helpwin.refresh()
+            helpwin.getch()
+            helpwin.clear()
+            helpwin.refresh()
+            draw_menu(maxy,maxx)
+            taskview.update()
+        elif c==curses.KEY_RESIZE:
+            stdscr.clear()
+            stdscr.refresh()
+            (maxy,maxx) = stdscr.getmaxyx()
+            draw_menu(maxy,maxx)
+            cmdwin = draw_cmdwin(maxy,maxx)
+            taskview.handleresize()
+
+if __name__ == '__main__':
+    curses.wrapper(main)
+    sys.exit(0)
